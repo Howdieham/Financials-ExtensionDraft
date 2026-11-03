@@ -72,7 +72,11 @@ class BaseClient:
         ]
 
         if curl_cffi_present:
-            self.session = requests.Session()
+            impersonate = os.environ.get('CURL_IMPERSONATE', 'chrome')
+            try:
+                self.session = requests.Session(impersonate=impersonate)
+            except TypeError:
+                self.session = requests.Session()
             if logger.isEnabledFor(logging.DEBUG) and self.session.curl:
                 self.session.curl.debug()
         else:

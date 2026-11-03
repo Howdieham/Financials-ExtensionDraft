@@ -168,19 +168,40 @@ class Yahoo(BaseClient):
 
         return text
 
+    def _ensure_crumb(self):
+        if not self.crumb:
+            new_crumb = self.fetch_crumb()
+            if new_crumb:
+                self.crumb = new_crumb
+                logger.debug(f"Crumb successfully set: {self.crumb}")
+        return self.crumb
+
     def fetch_crumb(self):
         """Refreshes the crumb using the current session."""
         try:
-            # Grab cookies
-            self.session.get("https://finance.yahoo.com/quote/SPY", timeout=10)
-            
-            # Request crumb endpoint
-            response = self.session.get("https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10)
-            
-            if response.status_code == 200:
-                return response.text.strip()
+            self.session.get("https://fc.yahoo.com", timeout=10)
         except Exception as e:
-            logger.error(f"Failed to fetch crumb: {e}")
+            logger.debug(f"Failed to grab cookie from fc.yahoo.com: {e}")
+
+        try:
+            self.handleCookiesAndConsent("https://finance.yahoo.com/quote/SPY", "SPY", 0, "yahoo-SPY.html")
+        except Exception as e:
+            logger.debug(f"Failed to grab cookies from finance.yahoo.com: {e}")
+
+        for host in ("query1", "query2"):
+            for attempt in range(3):
+                response = None
+                try:
+                    response = self.session.get(f"https://{host}.finance.yahoo.com/v1/test/getcrumb", timeout=10)
+                    if response.status_code == 200:
+                        crumb = response.text.strip()
+                        if crumb and len(crumb) < 100 and '<' not in crumb:
+                            return crumb
+                    logger.warning(f"getcrumb via {host} attempt {attempt + 1}: status={response.status_code}")
+                except Exception as e:
+                    logger.error(f"Failed to fetch crumb via {host}: {e}")
+                if response is not None and response.status_code == 429:
+                    time.sleep(2 ** attempt)
         return None
 
     def getRealtime(self, ticker, datacode):
@@ -209,31 +230,30 @@ class Yahoo(BaseClient):
 
         tick = self.realtime[ticker]
 
-        if not self.crumb:
-            new_crumb = self.fetch_crumb()
-            if new_crumb:
-                self.crumb = new_crumb
-                logger.debug(f"Crumb successfully set: {self.crumb}")
-            else:
+        js = None
+        for attempt in range(2):
+            if not self._ensure_crumb():
                 del self.realtime[ticker]
                 return f'Yahoo.getRealtime({ticker}, {datacode}) - failed to fetch crumb'
 
-        if not self.crumb:
-            return 'Yahoo.getRealtime({}, {}) - crumb missing'.format(ticker, datacode)
+            try:
 
-        try:
+                url = 'https://query1.finance.yahoo.com/v10/finance/quoteSummary/{}?formatted=true&' \
+                      'modules=summaryProfile,financialData,quoteType,recommendationTrend,earnings,equityPerformance,summaryDetail,defaultKeyStatistics,calendarEvents,esgScores,price,pageViews,financialsTemplate&' \
+                      'lang=en-US&region=US&crumb={}' \
+                    .format(ticker, urllib.parse.quote_plus(self.crumb))
 
-            url = 'https://query1.finance.yahoo.com/v10/finance/quoteSummary/{}?formatted=true&' \
-                  'modules=summaryProfile,financialData,quoteType,recommendationTrend,earnings,equityPerformance,summaryDetail,defaultKeyStatistics,calendarEvents,esgScores,price,pageViews,financialsTemplate&' \
-                  'lang=en-US&region=US&crumb={}' \
-                .format(ticker, urllib.parse.quote_plus(self.crumb))
+                js = self.urlopen(url)
+                break
 
-            js = self.urlopen(url)
-
-        except HttpException as e:
-            logger.exception("HttpException querying ticker=%s datacode=%s", ticker, datacode)
-            del self.realtime[ticker]
-            return None
+            except HttpException as e:
+                status = getattr(e.response, 'status_code', None)
+                logger.exception("HttpException querying ticker=%s datacode=%s status=%s", ticker, datacode, status)
+                if status == 401 and attempt == 0:
+                    self.crumb = None
+                    continue
+                del self.realtime[ticker]
+                return None
 
         try:
 
@@ -400,9 +420,6 @@ class Yahoo(BaseClient):
         if not self.crumb:
             self.getRealtime(ticker, Datacode.LAST_PRICE)
 
-        if not self.crumb:
-            return 'Yahoo.getHistoric({}, {}, {}) - crumb missing'.format(ticker, datacode, date)
-
         try:
             t1 = int(date_as_dt.timestamp())
             t2 = int(time.time())
@@ -422,22 +439,37 @@ class Yahoo(BaseClient):
             logger.exception("BaseException ticker=%s datacode=%s", ticker, datacode)
             return 'Yahoo.getHistoric({}, {}, {}) - date: {}'.format(ticker, datacode, date, e)
 
-        try:
-
+        text = None
+        for attempt in range(2):
             url = 'https://query1.finance.yahoo.com/v8/finance/chart/{}' \
-                  '?period1={}&period2={}&interval=1d&events=history&crumb={}' \
-                .format(ticker, t1, t2, urllib.parse.quote_plus(self.crumb))
+                  '?period1={}&period2={}&interval=1d&events=history' \
+                .format(ticker, t1, t2)
+            if self.crumb:
+                url += '&crumb={}'.format(urllib.parse.quote_plus(self.crumb))
 
-            text = self.urlopen(url)
+            try:
+                text = self.urlopen(url)
+                break
+            except HttpException as e:
+                status = getattr(e.response, 'status_code', None)
+                logger.exception("HttpException ticker=%s datacode=%s date=%s status=%s", ticker, datacode, date, status)
+                if status == 401 and attempt == 0:
+                    self.crumb = None
+                    self._ensure_crumb()
+                    continue
+                return None
+            except BaseException as e:
+                logger.exception("BaseException ticker=%s datacode=%s date=%s", ticker, datacode, date)
+                return 'Yahoo.getHistoric({}, {}, {}) - urlopen: {}'.format(ticker, datacode, date, e)
 
+        if text is None:
+            return None
+
+        try:
             with open(os.path.join(self.basedir, 'yahoo-hist-{}.json'.format(ticker)), "w", encoding="utf-8") as csv_file:
                 print(text, file=csv_file)
 
             self._read_ticker_json_file(ticker)
-
-        except HttpException:
-            logger.exception("HttpException ticker=%s datacode=%s date=%s", ticker, datacode, date)
-            return None
 
         except BaseException as e:
             logger.exception("BaseException ticker=%s datacode=%s date=%s", ticker, datacode, date)
